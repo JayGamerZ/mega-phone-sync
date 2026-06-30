@@ -1,0 +1,105 @@
+name: Mega Cloud Sync
+
+on:
+  # Phone pushes files → syncs to Mega
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'mega-state.txt'
+      - '.github/**'
+
+  # Periodic check for Mega changes → syncs to repo
+  schedule:
+    - cron: '*/30 * * * *'
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      direction:
+        description: 'Sync direction'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - mega-to-repo
+          - repo-to-mega
+
+concurrency:
+  group: mega-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install rclone
+        run: |
+          curl -sL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb
+          sudo dpkg -i /tmp/rclone.deb
+          rclone version
+
+      - name: Configure Mega
+        run: |
+          rclone config create mega mega \
+            user="${{ secrets.MEGA_EMAIL }}" \
+            pass="${{ secrets.MEGA_PASSWORD }}"
+
+      # ─── DIRECTION: Phone → Mega ───
+      - name: Upload to Mega (triggered by push)
+        if: github.event_name == 'push' || github.event.inputs.direction == 'repo-to-mega' || github.event.inputs.direction == 'both'
+        run: |
+          echo "📤 Uploading repo files to Mega..."
+          rclone copy --progress --update ./ mega:/
+          echo "✅ Done! Phone files are now on Mega."
+
+      # ─── DIRECTION: Mega → Phone ───
+      - name: Smart detect Mega changes
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        id: detect
+        run: |
+          echo "🔍 Checking Mega for changes..."
+
+          # Use rclone check for proper diff detection (size + modtime)
+          # Writes missing/new files to mega-new.txt and changed to mega-changed.txt
+          rclone check mega:/ ./ \
+            --combined /tmp/mega-diff.txt 2>&1 || true
+
+          if [ -s /tmp/mega-diff.txt ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "📦 Changes detected on Mega!"
+
+            # Show what changed
+            echo "=== Files to sync ==="
+            cat /tmp/mega-diff.txt
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "✅ No changes on Mega. Skipping."
+          fi
+
+      - name: Download from Mega (when changes detected)
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          echo "📥 Downloading changes from Mega..."
+          rclone copy --progress --update mega:/ ./
+          echo "✅ Done! Mega files are now in repo."
+
+      - name: Commit & push changes to repo
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          git config user.name "Mega Sync Bot 🤖"
+          git config user.email "bot@mega-sync"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit."
+          else
+            git commit -m "📁 Auto-sync from Mega [$(date +'%Y-%m-%d %H:%M UTC')]"
+            git push
+            echo "✅ Changes pushed to repo!"
+          fi

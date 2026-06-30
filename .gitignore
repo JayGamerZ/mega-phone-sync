@@ -1,0 +1,6 @@
+# Don't sync mega-state tracking or rclone junk
+mega-state.txt
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
